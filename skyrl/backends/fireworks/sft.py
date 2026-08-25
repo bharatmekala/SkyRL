@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, Optional
 import torch
 from loguru import logger
 
+from skyrl.backends.fireworks.multimodal import ImageSpan, splice_model_input
 from skyrl.backends.fireworks.training_backend import FireworksPolicyDispatch
 from skyrl.backends.skyrl_train.distributed.dispatch import WorkerOutput
 from skyrl.backends.skyrl_train.training_batch import TrainingInputBatch
@@ -25,6 +26,7 @@ class SFTDatumSpec:
     model_input_token_ids: tuple[int, ...]
     target_tokens: tuple[int, ...]
     weights: tuple[float, ...]
+    image_spans: tuple[ImageSpan, ...] = ()
 
     def __post_init__(self) -> None:
         expected = len(self.model_input_token_ids)
@@ -32,6 +34,21 @@ class SFTDatumSpec:
         mismatched = {name: length for name, length in lengths.items() if length != expected}
         if mismatched:
             raise ValueError(f"SFT datum fields must all have length {expected}, got {mismatched}")
+        previous_end = 0
+        previous_offset = -1
+        for span in self.image_spans:
+            end = span.offset + span.length
+            if span.offset < 0 or span.length <= 0 or end > expected:
+                raise ValueError(
+                    f"Image span offset={span.offset} length={span.length} "
+                    f"is outside model-input token count {expected}"
+                )
+            if span.offset < previous_offset:
+                raise ValueError("Image spans must be ordered by offset")
+            if span.offset < previous_end:
+                raise ValueError("Image spans must not overlap")
+            previous_offset = span.offset
+            previous_end = end
 
 
 def _matrix(batch: TrainingInputBatch, name: str) -> torch.Tensor:
@@ -104,12 +121,26 @@ def training_batch_to_sft_datum_specs(
     attention_mask = _matrix(batch, "attention_mask")
     loss_mask = _matrix(batch, "loss_mask").float()
     response_width = loss_mask.shape[1]
+    image_spans_by_row = (batch.metadata or {}).get("image_spans")
+    if image_spans_by_row is None:
+        image_spans_by_row = [()] * batch.batch_size
+    if len(image_spans_by_row) != batch.batch_size:
+        raise ValueError(
+            f"Fireworks SFT image span metadata has {len(image_spans_by_row)} rows, " f"expected {batch.batch_size}"
+        )
     specs: list[SFTDatumSpec] = []
 
     for row_index in range(batch.batch_size):
         tokens = _tokens(sequences[row_index], attention_mask[row_index], row_index)
         if len(tokens) < 2:
             raise ValueError(f"Fireworks SFT sample {row_index} must contain at least two tokens")
+        image_spans = tuple(image_spans_by_row[row_index])
+        for span in image_spans:
+            if span.offset + span.length > len(tokens) - 1:
+                raise ValueError(
+                    f"Fireworks SFT image span {span!r} reaches the final token for "
+                    f"sample {row_index}; token count={len(tokens)}"
+                )
         model_input = tokens[:-1]
         if max_seq_len is not None and len(model_input) > max_seq_len:
             raise ValueError(
@@ -133,6 +164,7 @@ def training_batch_to_sft_datum_specs(
                 model_input_token_ids=tuple(model_input),
                 target_tokens=tuple(tokens[1:]),
                 weights=tuple(weights),
+                image_spans=image_spans,
             )
         )
 
@@ -155,7 +187,11 @@ def build_tinker_sft_datums(
 
     return [
         tinker.Datum(
-            model_input=tinker.ModelInput.from_ints(list(spec.model_input_token_ids)),
+            model_input=(
+                splice_model_input(spec.model_input_token_ids, spec.image_spans)
+                if spec.image_spans
+                else tinker.ModelInput.from_ints(list(spec.model_input_token_ids))
+            ),
             loss_fn_inputs={
                 "target_tokens": tinker.TensorData(data=list(spec.target_tokens), dtype="int64"),
                 "weights": tinker.TensorData(data=list(spec.weights), dtype="float32"),

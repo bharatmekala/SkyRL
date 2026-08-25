@@ -26,6 +26,7 @@ import multiprocessing as mp
 import os
 import tempfile
 from dataclasses import asdict
+from importlib.metadata import version
 from typing import Any, Optional
 
 import ray
@@ -182,6 +183,7 @@ def _compute_cache_key(
     tools_key: Optional[str],
     system_key: Optional[str],
     train_on_last_n: Optional[int] = None,
+    tokenization_backend: str = "hf",
 ) -> str:
     """Compute a cache key (hash) for a tokenized dataset.
 
@@ -216,10 +218,16 @@ def _compute_cache_key(
             "train_on_last_n": train_on_last_n,
             "tools_key": tools_key,
             "system_key": system_key,
+            "tokenization_backend": tokenization_backend,
         },
         sort_keys=True,
     )
     return hashlib.sha256(cache_params.encode()).hexdigest()[:16]
+
+
+def _renderer_tokenization_backend(renderer: Any) -> str:
+    renderer_type = type(renderer)
+    return f"renderers-{version('renderers')}:" f"{renderer_type.__module__}.{renderer_type.__qualname__}"
 
 
 def _get_cache_path(cache_dir: str, cache_key: str) -> str:
@@ -453,6 +461,7 @@ def tokenize_chat_example(
     system_key: Optional[str] = "system",
     processor=None,
     _drop_stats: Optional[dict[str, int]] = None,
+    renderer=None,
     **tokenizer_kwargs,
 ) -> dict | None:
     """Tokenize a chat-format example with configurable loss targets.
@@ -524,7 +533,7 @@ def tokenize_chat_example(
     # a single forward over the full conversation).
     has_images = any(
         isinstance(m.get("content"), list)
-        and any(isinstance(d, dict) and d.get("type") == "image" for d in m["content"])
+        and any(isinstance(d, dict) and d.get("type") in ("image", "image_url") for d in m["content"])
         for m in messages
     )
     if has_images and train_on_what in (
@@ -534,10 +543,38 @@ def tokenize_chat_example(
         raise NotImplementedError(
             "Training on all or the last N assistant messages with vision inputs is not yet supported"
         )
+    if renderer is not None:
+        if tools is not None:
+            raise NotImplementedError("tools with renderer-backed VLM SFT are not supported")
+        token_ids, loss_mask, image_spans = _tokenize_with_renderer(renderer, messages)
+        if max_length is not None and len(token_ids) > max_length:
+            logger.warning(
+                f"Dropping VLM sample longer than max_length={max_length}, "
+                "consider increasing max_length if you see this warning too much"
+            )
+            if _drop_stats is not None:
+                _drop_stats["vlm_overlength"] = _drop_stats.get("vlm_overlength", 0) + 1
+            return None
+        if not any(loss_mask):
+            if _drop_stats is not None:
+                _drop_stats["zero_supervision"] = _drop_stats.get("zero_supervision", 0) + 1
+            return None
+        return {
+            "input_ids": token_ids,
+            "attention_mask": [1] * len(token_ids),
+            "num_actions": len(token_ids),
+            "loss_mask": [int(value) for value in loss_mask],
+            "image_spans": tuple(image_spans),
+        }
 
     if train_on_what == TrainOnWhat.LAST_ASSISTANT_MESSAGE:
         return _tokenize_chat_last_assistant(
-            messages, tokenizer, max_length, processor if has_images else None, **tokenizer_kwargs
+            messages,
+            tokenizer,
+            max_length,
+            processor if has_images else None,
+            _drop_stats=_drop_stats,
+            **tokenizer_kwargs,
         )
     else:
         # ALL_ASSISTANT_MESSAGES
@@ -549,6 +586,12 @@ def tokenize_chat_example(
             _drop_stats=_drop_stats,
             **tokenizer_kwargs,
         )
+
+
+def _tokenize_with_renderer(renderer, messages):
+    from skyrl.backends.fireworks.multimodal import render_supervised_example
+
+    return render_supervised_example(renderer, messages)
 
 
 def _unbatch(proc_tok_output):
@@ -567,6 +610,7 @@ def _tokenize_chat_last_assistant(
     tokenizer,
     max_length: Optional[int] = None,
     processor=None,
+    _drop_stats: Optional[dict[str, int]] = None,
     **tokenizer_kwargs,
 ) -> dict | None:
     """Tokenize a conversation and compute loss only on the last assistant message.
@@ -625,6 +669,8 @@ def _tokenize_chat_last_assistant(
         logger.warning(
             f"Dropping VLM sample longer than max_length={max_length}, consider increasing max_length if you see this warning too much"
         )
+        if _drop_stats is not None:
+            _drop_stats["vlm_overlength"] = _drop_stats.get("vlm_overlength", 0) + 1
         return None
 
     vlm_kwargs = {}  # We only support Qwen-style image kwargs at the moment
@@ -636,6 +682,8 @@ def _tokenize_chat_last_assistant(
 
     num_actions = len(full_input_ids) - len(full_prompt_ids)
     if num_actions <= 0:
+        if processor is not None and _drop_stats is not None:
+            _drop_stats["zero_supervision"] = _drop_stats.get("zero_supervision", 0) + 1
         return None
 
     return {
@@ -802,7 +850,10 @@ def collate_sft_batch(examples: list, tokenizer) -> TrainingInputBatch:
             "image_grid_thw": TensorList(image_grid_thw) if batch_has_images else None,
         }
     )
-    batch.metadata = {"response_length": max_num_actions}
+    batch.metadata = {
+        "response_length": max_num_actions,
+        "image_spans": [tuple(ex.get("image_spans", ())) for ex in examples],
+    }
     return batch
 
 
@@ -870,6 +921,7 @@ class SFTTrainer:
         self.cfg = skyrl_cfg if skyrl_cfg is not None else build_skyrl_config_for_sft(cfg)
         self.tokenizer = None
         self.processor = None  # set in setup() for VLM models
+        self.renderer = None
         self.is_vlm = False
         self.dispatch: WorkerDispatch | None = None
         self.tracker: Tracking | None = None
@@ -1105,6 +1157,8 @@ class SFTTrainer:
         Returns a list of tokenized examples (dicts with ``input_ids``,
         ``attention_mask``, ``num_actions``).
         """
+        renderer = self.renderer
+
         # Check cache first (unless disabled or force_recache)
         if not self.sft_cfg.disable_cache:
             cache_dir = self.sft_cfg.cache_dir
@@ -1122,6 +1176,7 @@ class SFTTrainer:
                 tools_key=tools_key,
                 system_key=system_key,
                 train_on_last_n=self.sft_cfg.train_on_last_n,
+                tokenization_backend=(_renderer_tokenization_backend(renderer) if renderer is not None else "hf"),
             )
             cache_path = _get_cache_path(cache_dir, cache_key)
 
@@ -1139,12 +1194,16 @@ class SFTTrainer:
 
         columns = dataset.column_names
         num_workers = self.sft_cfg.num_workers
-
         # The HF processor needed for VLM tokenization does not round-trip
         # cleanly through the spawn-based worker pool, so VLM tokenization runs
         # sequentially.
-        if self.is_vlm and num_workers != 0:
-            logger.warning("VLM detected: forcing sequential tokenization (num_workers=0).")
+        if (self.is_vlm or renderer is not None) and num_workers != 0:
+            reasons = []
+            if self.is_vlm:
+                reasons.append("VLM processor")
+            if renderer is not None:
+                reasons.append("renderer-backed tokenization")
+            logger.warning("Forcing sequential tokenization (num_workers=0) for " + " and ".join(reasons) + ".")
             num_workers = 0
 
         # Sequential tokenization path
@@ -1166,6 +1225,7 @@ class SFTTrainer:
                         system_key=system_key,
                         processor=self.processor,
                         _drop_stats=drop_stats,
+                        renderer=renderer,
                     )
                     for ex in dataset
                 ]
@@ -1179,6 +1239,10 @@ class SFTTrainer:
                 )
             tokenized = [ex for ex in tokenized if ex is not None]
             logger.info(f"Tokenized {len(tokenized)} examples (filtered from {len(dataset)})")
+            if drop_stats.get("vlm_overlength", 0):
+                logger.info(f"Dropped {drop_stats['vlm_overlength']} VLM rows exceeding max_length.")
+            if drop_stats.get("zero_supervision", 0):
+                logger.info(f"Dropped {drop_stats['zero_supervision']} VLM rows with zero supervised tokens.")
             if self.sft_cfg.train_on_what == TrainOnWhat.LAST_N_ASSISTANT_MESSAGES:
                 logger.info(
                     f"Dropped {drop_stats.get('last_n_truncation', 0)} rows because the last "

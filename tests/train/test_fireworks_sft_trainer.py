@@ -8,10 +8,10 @@ import torch
 from skyrl.backends.fireworks.sft import FireworksSFTDispatch
 from skyrl.backends.skyrl_train.distributed.dispatch import WorkerOutput
 from skyrl.backends.skyrl_train.training_batch import TrainingInputBatch
-from skyrl.train.config import SFTConfig, build_skyrl_config_for_sft
+from skyrl.train.config import SFTConfig, TrainOnWhat, build_skyrl_config_for_sft
 from skyrl.train.entrypoints.main_fireworks_sft import run
 from skyrl.train.fireworks_sft_trainer import FireworksSFTTrainer
-from skyrl.train.sft_trainer import SFTTrainer
+from skyrl.train.sft_trainer import SFTTrainer, tokenize_chat_example
 
 
 class _Runtime:
@@ -123,6 +123,7 @@ def test_setup_uses_tokenizer_only_path(monkeypatch) -> None:
         return "tokenizer"
 
     monkeypatch.setattr("skyrl.train.fireworks_sft_trainer.get_tokenizer", tokenizer)
+    monkeypatch.setattr("skyrl.train.fireworks_sft_trainer.check_is_vlm", lambda path: False)
     monkeypatch.setattr(trainer, "_build_collator", lambda value: ("collator", value))
     monkeypatch.setattr(trainer, "_init_tracker", lambda: seen.update(tracker=True))
     monkeypatch.setattr(trainer, "_init_workers", lambda: seen.update(workers=True))
@@ -140,6 +141,108 @@ def test_setup_uses_tokenizer_only_path(monkeypatch) -> None:
         "tracker": True,
         "workers": True,
     }
+
+
+def test_setup_initializes_renderer_for_vlm(monkeypatch) -> None:
+    trainer = _trainer()
+    trainer.sft_cfg.remove_microbatch_padding = False
+    tokenizer = SimpleNamespace(name_or_path="Qwen/Qwen3-VL-8B-Instruct")
+
+    class Renderer:
+        is_multimodal = True
+
+        def __init__(self, tokenizer):
+            self.tokenizer = tokenizer
+
+    monkeypatch.setattr("skyrl.train.fireworks_sft_trainer.get_tokenizer", lambda path, **kwargs: tokenizer)
+    monkeypatch.setattr("skyrl.train.fireworks_sft_trainer.check_is_vlm", lambda path: True)
+    monkeypatch.setattr(trainer, "_build_collator", lambda value: ("collator", value))
+    monkeypatch.setattr(trainer, "_init_tracker", lambda: None)
+    monkeypatch.setattr(trainer, "_init_workers", lambda: None)
+
+    import renderers
+
+    monkeypatch.setattr(renderers, "create_renderer", Renderer)
+    monkeypatch.setattr(renderers, "is_multimodal", lambda renderer: renderer.is_multimodal)
+
+    trainer.setup()
+
+    assert trainer.is_vlm is True
+    assert trainer.processor is None
+    assert isinstance(trainer.renderer, Renderer)
+    assert trainer.renderer.tokenizer is tokenizer
+
+
+def test_setup_rejects_last_n_training_for_vlm(monkeypatch) -> None:
+    trainer = _trainer()
+    trainer.sft_cfg.train_on_what = TrainOnWhat.LAST_N_ASSISTANT_MESSAGES
+    monkeypatch.setattr(
+        "skyrl.train.fireworks_sft_trainer.get_tokenizer",
+        lambda path, **kwargs: SimpleNamespace(name_or_path=path),
+    )
+    monkeypatch.setattr("skyrl.train.fireworks_sft_trainer.check_is_vlm", lambda path: True)
+
+    with pytest.raises(ValueError, match="train_on_what=last_assistant_message"):
+        trainer.setup()
+
+
+def test_renderer_rejects_tools(monkeypatch) -> None:
+    renderer = object()
+    example = {
+        "messages": [
+            {"role": "user", "content": "Call the tool."},
+            {"role": "assistant", "content": "I cannot."},
+        ],
+        "tools": [{"type": "function", "function": {"name": "lookup"}}],
+    }
+
+    with pytest.raises(NotImplementedError, match="tools.*renderer-backed VLM SFT"):
+        tokenize_chat_example(example, SimpleNamespace(), renderer=renderer)
+
+
+def test_image_url_content_is_recognized_by_vision_gate() -> None:
+    example = {
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64,not-decoded-here"},
+                    },
+                    {"type": "text", "text": "Describe this."},
+                ],
+            },
+            {"role": "assistant", "content": "A picture."},
+        ]
+    }
+
+    with pytest.raises(NotImplementedError, match="last N assistant messages"):
+        tokenize_chat_example(
+            example,
+            SimpleNamespace(),
+            train_on_what=TrainOnWhat.ALL_ASSISTANT_MESSAGES,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("use_sequence_packing", True, "use_sequence_packing=False"),
+        ("remove_microbatch_padding", True, "remove_microbatch_padding=False"),
+    ],
+)
+def test_setup_rejects_contradictory_vlm_layout_settings(monkeypatch, field, value, message) -> None:
+    trainer = _trainer()
+    setattr(trainer.sft_cfg, field, value)
+    monkeypatch.setattr(
+        "skyrl.train.fireworks_sft_trainer.get_tokenizer",
+        lambda path, **kwargs: SimpleNamespace(name_or_path=path),
+    )
+    monkeypatch.setattr("skyrl.train.fireworks_sft_trainer.check_is_vlm", lambda path: True)
+
+    with pytest.raises(ValueError, match=message):
+        trainer.setup()
 
 
 def test_tracker_initialization_is_deferred() -> None:

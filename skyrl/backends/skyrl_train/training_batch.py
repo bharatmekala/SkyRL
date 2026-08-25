@@ -300,7 +300,8 @@ class TensorBatch(dict, Generic[DictType]):
     def repeat(self, repeats: int):
         """Repeat entries in the data batch a specified number of times.
 
-        This is similar to `torch.repeat` (and `numpy.tile`). `metadata` is not repeated.
+        This is similar to `torch.repeat` (and `numpy.tile`). Row-aligned
+        image-span metadata is repeated alongside the tensor rows.
 
         Args:
             repeats: The number of times to repeat the data batch
@@ -318,13 +319,16 @@ class TensorBatch(dict, Generic[DictType]):
                 assert isinstance(value, torch.Tensor), f"Field {key} must be a tensor, got {type(value)}"
                 new_batch[key] = value.repeat(repeats)
         new_batch = self.__class__(new_batch)
-        new_batch.metadata = self.metadata
+        new_batch.metadata = dict(self.metadata) if self.metadata is not None else None
+        if new_batch.metadata is not None and "image_spans" in new_batch.metadata:
+            new_batch.metadata["image_spans"] = new_batch.metadata["image_spans"] * repeats
         return new_batch
 
     def repeat_interleave(self, repeats: int):
         """Repeat entries in the data batch a specified number of times.
 
-        This is similar to `torch.repeat_interleave` (and `numpy.repeat`). `metadata` is not repeated.
+        This is similar to `torch.repeat_interleave` (and `numpy.repeat`).
+        Row-aligned image-span metadata is repeated alongside the tensor rows.
 
         Args:
             repeats: The number of times to repeat the data batch
@@ -342,7 +346,10 @@ class TensorBatch(dict, Generic[DictType]):
                 assert isinstance(value, torch.Tensor), f"Field {key} must be a tensor, got {type(value)}"
                 new_batch[key] = value.repeat_interleave(repeats)
         new_batch = self.__class__(new_batch)
-        new_batch.metadata = self.metadata
+        new_batch.metadata = dict(self.metadata) if self.metadata is not None else None
+        if new_batch.metadata is not None and "image_spans" in new_batch.metadata:
+            image_spans = new_batch.metadata["image_spans"]
+            new_batch.metadata["image_spans"] = [spans for spans in image_spans for _ in range(repeats)]
         return new_batch
 
     def chunk(self, chunk_size: int) -> List["TensorBatch[DictType]"]:
@@ -360,7 +367,7 @@ class TensorBatch(dict, Generic[DictType]):
                     # `None` values are not chunked
                     chunk_data[key] = value
             chunk = self.__class__(chunk_data)
-            chunk.metadata = self.metadata
+            chunk.metadata = self._row_metadata(slice(i, i + chunk_size))
             chunks.append(chunk)
         return chunks
 
@@ -387,8 +394,18 @@ class TensorBatch(dict, Generic[DictType]):
                 # `None` values are not sliced
                 sliced_data[key] = value
         sliced_batch = self.__class__(sliced_data)
-        sliced_batch.metadata = self.metadata
+        sliced_batch.metadata = self._row_metadata(slice_obj)
         return sliced_batch
+
+    def _row_metadata(self, selector) -> Optional[Dict[str, Any]]:
+        """Copy metadata while slicing row-aligned sidecars."""
+        if self.metadata is None:
+            return None
+        metadata = dict(self.metadata)
+        image_spans = metadata.get("image_spans")
+        if image_spans is not None:
+            metadata["image_spans"] = image_spans[selector]
+        return metadata
 
     def save(self, path: str):
         """Save the data to a pickle file"""
@@ -423,7 +440,14 @@ class TensorBatch(dict, Generic[DictType]):
             else:
                 # `None` values are not cat'd
                 cat_data[key] = value
-        metadata = shards[0].metadata
+        metadata = dict(shards[0].metadata) if shards[0].metadata is not None else None
+        if any((shard.metadata or {}).get("image_spans") is not None for shard in shards):
+            metadata = metadata or {}
+            metadata["image_spans"] = [
+                spans
+                for shard in shards
+                for spans in (shard.metadata or {}).get("image_spans", [()] * shard.batch_size)
+            ]
         cat_batch = cls(cat_data)
         cat_batch.metadata = metadata
         return cat_batch
@@ -539,6 +563,8 @@ def pad_training_input_batch(unpadded_batch: TrainingInputBatch, pad_size: int) 
             new_metadata["uids"] = value + [f"pad{i}" for i in range(pad_size)]
         elif key == "is_last_step":
             new_metadata["is_last_step"] = value + [True for _ in range(pad_size)]
+        elif key == "image_spans":
+            new_metadata["image_spans"] = value + [() for _ in range(pad_size)]
         else:
             new_metadata[key] = copy.deepcopy(value)
     new_metadata["pad_size"] = pad_size

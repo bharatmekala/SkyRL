@@ -8,7 +8,7 @@ import torch
 from skyrl.backends.fireworks.sft import FireworksSFTDispatch
 from skyrl.backends.skyrl_train.distributed.dispatch import WorkerOutput
 from skyrl.backends.skyrl_train.training_batch import TrainingInputBatch
-from skyrl.train.config import SFTConfig, build_skyrl_config_for_sft
+from skyrl.train.config import SFTConfig, TrainOnWhat, build_skyrl_config_for_sft
 from skyrl.train.entrypoints.main_fireworks_sft import run
 from skyrl.train.fireworks_sft_trainer import FireworksSFTTrainer
 from skyrl.train.sft_trainer import SFTTrainer
@@ -171,6 +171,19 @@ def test_setup_initializes_renderer_for_vlm(monkeypatch) -> None:
     assert trainer.processor is None
     assert isinstance(trainer.renderer, Renderer)
     assert trainer.renderer.tokenizer is tokenizer
+
+
+def test_setup_rejects_last_n_training_for_vlm(monkeypatch) -> None:
+    trainer = _trainer()
+    trainer.sft_cfg.train_on_what = TrainOnWhat.LAST_N_ASSISTANT_MESSAGES
+    monkeypatch.setattr(
+        "skyrl.train.fireworks_sft_trainer.get_tokenizer",
+        lambda path, **kwargs: SimpleNamespace(name_or_path=path),
+    )
+    monkeypatch.setattr("skyrl.train.fireworks_sft_trainer.check_is_vlm", lambda path: True)
+
+    with pytest.raises(ValueError, match="train_on_what=last_assistant_message"):
+        trainer.setup()
 
 
 @pytest.mark.parametrize(

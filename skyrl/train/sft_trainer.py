@@ -550,8 +550,12 @@ def tokenize_chat_example(
                 f"Dropping VLM sample longer than max_length={max_length}, "
                 "consider increasing max_length if you see this warning too much"
             )
+            if _drop_stats is not None:
+                _drop_stats["vlm_overlength"] = _drop_stats.get("vlm_overlength", 0) + 1
             return None
         if not any(loss_mask):
+            if _drop_stats is not None:
+                _drop_stats["zero_supervision"] = _drop_stats.get("zero_supervision", 0) + 1
             return None
         return {
             "input_ids": token_ids,
@@ -563,7 +567,12 @@ def tokenize_chat_example(
 
     if train_on_what == TrainOnWhat.LAST_ASSISTANT_MESSAGE:
         return _tokenize_chat_last_assistant(
-            messages, tokenizer, max_length, processor if has_images else None, **tokenizer_kwargs
+            messages,
+            tokenizer,
+            max_length,
+            processor if has_images else None,
+            _drop_stats=_drop_stats,
+            **tokenizer_kwargs,
         )
     else:
         # ALL_ASSISTANT_MESSAGES
@@ -599,6 +608,7 @@ def _tokenize_chat_last_assistant(
     tokenizer,
     max_length: Optional[int] = None,
     processor=None,
+    _drop_stats: Optional[dict[str, int]] = None,
     **tokenizer_kwargs,
 ) -> dict | None:
     """Tokenize a conversation and compute loss only on the last assistant message.
@@ -657,6 +667,8 @@ def _tokenize_chat_last_assistant(
         logger.warning(
             f"Dropping VLM sample longer than max_length={max_length}, consider increasing max_length if you see this warning too much"
         )
+        if _drop_stats is not None:
+            _drop_stats["vlm_overlength"] = _drop_stats.get("vlm_overlength", 0) + 1
         return None
 
     vlm_kwargs = {}  # We only support Qwen-style image kwargs at the moment
@@ -668,6 +680,8 @@ def _tokenize_chat_last_assistant(
 
     num_actions = len(full_input_ids) - len(full_prompt_ids)
     if num_actions <= 0:
+        if processor is not None and _drop_stats is not None:
+            _drop_stats["zero_supervision"] = _drop_stats.get("zero_supervision", 0) + 1
         return None
 
     return {

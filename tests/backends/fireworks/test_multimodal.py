@@ -11,6 +11,7 @@ from skyrl.backends.fireworks.multimodal import (
     splice_model_input,
 )
 from skyrl.backends.fireworks.sft import (
+    SFTDatumSpec,
     build_tinker_sft_datums,
     training_batch_to_sft_datum_specs,
 )
@@ -43,6 +44,21 @@ def _sample(token_ids, placeholders, loss_mask=None):
 
 def _span(offset: int, length: int, data: bytes = _PNG) -> ImageSpan:
     return ImageSpan(offset, length, data, "png", "hash")
+
+
+@pytest.mark.parametrize(
+    "spans",
+    [
+        (_span(-1, 1),),
+        (_span(0, 0),),
+        (_span(3, 2),),
+        (_span(0, 2), _span(1, 2)),
+        (_span(2, 1), _span(0, 1)),
+    ],
+)
+def test_sft_datum_spec_validates_image_spans(spans):
+    with pytest.raises(ValueError):
+        SFTDatumSpec(tuple(range(4)), (0, 0, 0, 1), (0.0, 0.0, 0.0, 1.0), spans)
 
 
 @pytest.mark.parametrize(
@@ -221,10 +237,10 @@ def test_image_span_sidecar_is_row_aligned_through_collation_and_slicing():
 
 
 def test_image_span_sidecar_survives_batch_repeat_and_concatenation():
-    batch = TrainingInputBatch({"sequences": torch.tensor([[1], [2]])})
+    batch = TrainingInputBatch({"sequences": torch.tensor([1, 2])})
     batch.metadata = {"image_spans": [(_span(0, 1),), ()]}
     repeated = batch.repeat_interleave(2)
-    other = TrainingInputBatch({"sequences": torch.tensor([[3]])})
+    other = TrainingInputBatch({"sequences": torch.tensor([3])})
     other.metadata = {"image_spans": [(_span(0, 1, _JPEG),)]}
 
     concatenated = TrainingInputBatch.cat([repeated, other])

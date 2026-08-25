@@ -143,39 +143,34 @@ def test_setup_uses_tokenizer_only_path(monkeypatch) -> None:
     }
 
 
-def test_setup_initializes_renderer_and_processor_for_vlm(monkeypatch) -> None:
+def test_setup_initializes_renderer_for_vlm(monkeypatch) -> None:
     trainer = _trainer()
     trainer.sft_cfg.remove_microbatch_padding = False
     tokenizer = SimpleNamespace(name_or_path="Qwen/Qwen3-VL-8B-Instruct")
-    processor = object()
 
     class Renderer:
         is_multimodal = True
 
-        def __init__(self, tokenizer, config=None, *, processor=None):
+        def __init__(self, tokenizer):
             self.tokenizer = tokenizer
-            self.config = config
-            self.processor = processor
 
-    auto_renderer = Renderer(tokenizer, config=object())
     monkeypatch.setattr("skyrl.train.fireworks_sft_trainer.get_tokenizer", lambda path, **kwargs: tokenizer)
     monkeypatch.setattr("skyrl.train.fireworks_sft_trainer.check_is_vlm", lambda path: True)
-    monkeypatch.setattr("skyrl.train.fireworks_sft_trainer.get_processor", lambda path, **kwargs: processor)
     monkeypatch.setattr(trainer, "_build_collator", lambda value: ("collator", value))
     monkeypatch.setattr(trainer, "_init_tracker", lambda: None)
     monkeypatch.setattr(trainer, "_init_workers", lambda: None)
 
     import renderers
 
-    monkeypatch.setattr(renderers, "create_renderer", lambda tokenizer: auto_renderer)
+    monkeypatch.setattr(renderers, "create_renderer", Renderer)
     monkeypatch.setattr(renderers, "is_multimodal", lambda renderer: renderer.is_multimodal)
 
     trainer.setup()
 
     assert trainer.is_vlm is True
-    assert trainer.processor is processor
+    assert trainer.processor is None
     assert isinstance(trainer.renderer, Renderer)
-    assert trainer.renderer.processor is processor
+    assert trainer.renderer.tokenizer is tokenizer
 
 
 @pytest.mark.parametrize(

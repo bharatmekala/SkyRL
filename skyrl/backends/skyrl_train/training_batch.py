@@ -317,9 +317,9 @@ class TensorBatch(dict, Generic[DictType]):
                 new_batch[key] = value.repeat(repeats)
             else:
                 assert isinstance(value, torch.Tensor), f"Field {key} must be a tensor, got {type(value)}"
-                new_batch[key] = value.repeat((repeats,) + (1,) * (value.ndim - 1))
+                new_batch[key] = value.repeat(repeats)
         new_batch = self.__class__(new_batch)
-        new_batch.metadata = copy.deepcopy(self.metadata)
+        new_batch.metadata = dict(self.metadata) if self.metadata is not None else None
         if new_batch.metadata is not None and "image_spans" in new_batch.metadata:
             new_batch.metadata["image_spans"] = new_batch.metadata["image_spans"] * repeats
         return new_batch
@@ -344,9 +344,9 @@ class TensorBatch(dict, Generic[DictType]):
                 new_batch[key] = value.repeat_interleave(repeats)
             else:
                 assert isinstance(value, torch.Tensor), f"Field {key} must be a tensor, got {type(value)}"
-                new_batch[key] = value.repeat_interleave(repeats, dim=0)
+                new_batch[key] = value.repeat_interleave(repeats)
         new_batch = self.__class__(new_batch)
-        new_batch.metadata = copy.deepcopy(self.metadata)
+        new_batch.metadata = dict(self.metadata) if self.metadata is not None else None
         if new_batch.metadata is not None and "image_spans" in new_batch.metadata:
             image_spans = new_batch.metadata["image_spans"]
             new_batch.metadata["image_spans"] = [spans for spans in image_spans for _ in range(repeats)]
@@ -401,7 +401,7 @@ class TensorBatch(dict, Generic[DictType]):
         """Copy metadata while slicing row-aligned sidecars."""
         if self.metadata is None:
             return None
-        metadata = copy.deepcopy(self.metadata)
+        metadata = dict(self.metadata)
         image_spans = metadata.get("image_spans")
         if image_spans is not None:
             metadata["image_spans"] = image_spans[selector]
@@ -440,7 +440,7 @@ class TensorBatch(dict, Generic[DictType]):
             else:
                 # `None` values are not cat'd
                 cat_data[key] = value
-        metadata = copy.deepcopy(shards[0].metadata)
+        metadata = dict(shards[0].metadata) if shards[0].metadata is not None else None
         if any((shard.metadata or {}).get("image_spans") is not None for shard in shards):
             metadata = metadata or {}
             metadata["image_spans"] = [

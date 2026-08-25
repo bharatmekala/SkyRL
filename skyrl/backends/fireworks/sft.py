@@ -34,6 +34,21 @@ class SFTDatumSpec:
         mismatched = {name: length for name, length in lengths.items() if length != expected}
         if mismatched:
             raise ValueError(f"SFT datum fields must all have length {expected}, got {mismatched}")
+        previous_end = 0
+        previous_offset = -1
+        for span in self.image_spans:
+            end = span.offset + span.length
+            if span.offset < 0 or span.length <= 0 or end > expected:
+                raise ValueError(
+                    f"Image span offset={span.offset} length={span.length} "
+                    f"is outside model-input token count {expected}"
+                )
+            if span.offset < previous_offset:
+                raise ValueError("Image spans must be ordered by offset")
+            if span.offset < previous_end:
+                raise ValueError("Image spans must not overlap")
+            previous_offset = span.offset
+            previous_end = end
 
 
 def _matrix(batch: TrainingInputBatch, name: str) -> torch.Tensor:

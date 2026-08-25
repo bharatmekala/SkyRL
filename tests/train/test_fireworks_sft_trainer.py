@@ -11,7 +11,7 @@ from skyrl.backends.skyrl_train.training_batch import TrainingInputBatch
 from skyrl.train.config import SFTConfig, TrainOnWhat, build_skyrl_config_for_sft
 from skyrl.train.entrypoints.main_fireworks_sft import run
 from skyrl.train.fireworks_sft_trainer import FireworksSFTTrainer
-from skyrl.train.sft_trainer import SFTTrainer
+from skyrl.train.sft_trainer import SFTTrainer, tokenize_chat_example
 
 
 class _Runtime:
@@ -184,6 +184,45 @@ def test_setup_rejects_last_n_training_for_vlm(monkeypatch) -> None:
 
     with pytest.raises(ValueError, match="train_on_what=last_assistant_message"):
         trainer.setup()
+
+
+def test_renderer_rejects_tools(monkeypatch) -> None:
+    renderer = object()
+    example = {
+        "messages": [
+            {"role": "user", "content": "Call the tool."},
+            {"role": "assistant", "content": "I cannot."},
+        ],
+        "tools": [{"type": "function", "function": {"name": "lookup"}}],
+    }
+
+    with pytest.raises(NotImplementedError, match="tools.*renderer-backed VLM SFT"):
+        tokenize_chat_example(example, SimpleNamespace(), renderer=renderer)
+
+
+def test_image_url_content_is_recognized_by_vision_gate() -> None:
+    example = {
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64,not-decoded-here"},
+                    },
+                    {"type": "text", "text": "Describe this."},
+                ],
+            },
+            {"role": "assistant", "content": "A picture."},
+        ]
+    }
+
+    with pytest.raises(NotImplementedError, match="last N assistant messages"):
+        tokenize_chat_example(
+            example,
+            SimpleNamespace(),
+            train_on_what=TrainOnWhat.ALL_ASSISTANT_MESSAGES,
+        )
 
 
 @pytest.mark.parametrize(

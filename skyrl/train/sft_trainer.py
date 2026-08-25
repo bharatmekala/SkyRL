@@ -533,7 +533,7 @@ def tokenize_chat_example(
     # a single forward over the full conversation).
     has_images = any(
         isinstance(m.get("content"), list)
-        and any(isinstance(d, dict) and d.get("type") == "image" for d in m["content"])
+        and any(isinstance(d, dict) and d.get("type") in ("image", "image_url") for d in m["content"])
         for m in messages
     )
     if has_images and train_on_what in (
@@ -544,6 +544,8 @@ def tokenize_chat_example(
             "Training on all or the last N assistant messages with vision inputs is not yet supported"
         )
     if renderer is not None:
+        if tools is not None:
+            raise NotImplementedError("tools with renderer-backed VLM SFT are not supported")
         token_ids, loss_mask, image_spans = _tokenize_with_renderer(renderer, messages)
         if max_length is not None and len(token_ids) > max_length:
             logger.warning(
@@ -1237,6 +1239,10 @@ class SFTTrainer:
                 )
             tokenized = [ex for ex in tokenized if ex is not None]
             logger.info(f"Tokenized {len(tokenized)} examples (filtered from {len(dataset)})")
+            if drop_stats.get("vlm_overlength", 0):
+                logger.info(f"Dropped {drop_stats['vlm_overlength']} VLM rows exceeding max_length.")
+            if drop_stats.get("zero_supervision", 0):
+                logger.info(f"Dropped {drop_stats['zero_supervision']} VLM rows with zero supervised tokens.")
             if self.sft_cfg.train_on_what == TrainOnWhat.LAST_N_ASSISTANT_MESSAGES:
                 logger.info(
                     f"Dropped {drop_stats.get('last_n_truncation', 0)} rows because the last "

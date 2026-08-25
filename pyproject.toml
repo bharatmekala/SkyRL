@@ -47,6 +47,7 @@ fireworks = [
     "skyrl[skyrl-train]",
     "fireworks-ai[training]>=1.2.0a87,<2; python_version < '3.14'",
     "tinker>=0.3.0",
+    "renderers==0.1.8",
 ]
 
 ray = [

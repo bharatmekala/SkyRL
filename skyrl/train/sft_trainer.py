@@ -182,6 +182,7 @@ def _compute_cache_key(
     tools_key: Optional[str],
     system_key: Optional[str],
     train_on_last_n: Optional[int] = None,
+    tokenization_backend: str = "hf",
 ) -> str:
     """Compute a cache key (hash) for a tokenized dataset.
 
@@ -216,6 +217,7 @@ def _compute_cache_key(
             "train_on_last_n": train_on_last_n,
             "tools_key": tools_key,
             "system_key": system_key,
+            "tokenization_backend": tokenization_backend,
         },
         sort_keys=True,
     )
@@ -453,6 +455,7 @@ def tokenize_chat_example(
     system_key: Optional[str] = "system",
     processor=None,
     _drop_stats: Optional[dict[str, int]] = None,
+    renderer=None,
     **tokenizer_kwargs,
 ) -> dict | None:
     """Tokenize a chat-format example with configurable loss targets.
@@ -534,6 +537,23 @@ def tokenize_chat_example(
         raise NotImplementedError(
             "Training on all or the last N assistant messages with vision inputs is not yet supported"
         )
+    if renderer is not None:
+        token_ids, loss_mask, image_spans = _tokenize_with_renderer(renderer, messages)
+        if max_length is not None and len(token_ids) > max_length:
+            logger.warning(
+                f"Dropping VLM sample longer than max_length={max_length}, "
+                "consider increasing max_length if you see this warning too much"
+            )
+            return None
+        if not any(loss_mask):
+            return None
+        return {
+            "input_ids": token_ids,
+            "attention_mask": [1] * len(token_ids),
+            "num_actions": len(token_ids),
+            "loss_mask": [int(value) for value in loss_mask],
+            "image_spans": tuple(image_spans),
+        }
 
     if train_on_what == TrainOnWhat.LAST_ASSISTANT_MESSAGE:
         return _tokenize_chat_last_assistant(
@@ -549,6 +569,12 @@ def tokenize_chat_example(
             _drop_stats=_drop_stats,
             **tokenizer_kwargs,
         )
+
+
+def _tokenize_with_renderer(renderer, messages):
+    from skyrl.backends.fireworks.multimodal import render_supervised_example
+
+    return render_supervised_example(renderer, messages)
 
 
 def _unbatch(proc_tok_output):
@@ -802,7 +828,10 @@ def collate_sft_batch(examples: list, tokenizer) -> TrainingInputBatch:
             "image_grid_thw": TensorList(image_grid_thw) if batch_has_images else None,
         }
     )
-    batch.metadata = {"response_length": max_num_actions}
+    batch.metadata = {
+        "response_length": max_num_actions,
+        "image_spans": [tuple(ex.get("image_spans", ())) for ex in examples],
+    }
     return batch
 
 
@@ -1105,6 +1134,8 @@ class SFTTrainer:
         Returns a list of tokenized examples (dicts with ``input_ids``,
         ``attention_mask``, ``num_actions``).
         """
+        renderer = getattr(self, "renderer", None)
+
         # Check cache first (unless disabled or force_recache)
         if not self.sft_cfg.disable_cache:
             cache_dir = self.sft_cfg.cache_dir
@@ -1122,6 +1153,7 @@ class SFTTrainer:
                 tools_key=tools_key,
                 system_key=system_key,
                 train_on_last_n=self.sft_cfg.train_on_last_n,
+                tokenization_backend="renderers==0.1.8" if renderer is not None else "hf",
             )
             cache_path = _get_cache_path(cache_dir, cache_key)
 
@@ -1139,12 +1171,11 @@ class SFTTrainer:
 
         columns = dataset.column_names
         num_workers = self.sft_cfg.num_workers
-
         # The HF processor needed for VLM tokenization does not round-trip
         # cleanly through the spawn-based worker pool, so VLM tokenization runs
         # sequentially.
-        if self.is_vlm and num_workers != 0:
-            logger.warning("VLM detected: forcing sequential tokenization (num_workers=0).")
+        if renderer is not None and num_workers != 0:
+            logger.warning("Renderer-backed tokenization: forcing sequential tokenization (num_workers=0).")
             num_workers = 0
 
         # Sequential tokenization path
@@ -1166,6 +1197,7 @@ class SFTTrainer:
                         system_key=system_key,
                         processor=self.processor,
                         _drop_stats=drop_stats,
+                        renderer=renderer,
                     )
                     for ex in dataset
                 ]

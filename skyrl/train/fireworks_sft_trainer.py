@@ -5,12 +5,14 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+from typing import Any
 
 from skyrl.backends.fireworks.runtime import FireworksRuntime, PromotableCheckpoint
 from skyrl.backends.fireworks.sft import FireworksSFTDispatch
 from skyrl.backends.skyrl_train.utils.io import io
+from skyrl.train.config.sft_config import TrainOnWhat
 from skyrl.train.sft_trainer import SFTTrainer
-from skyrl.utils.tok import get_tokenizer
+from skyrl.utils.tok import check_is_vlm, get_processor, get_tokenizer
 
 
 class FireworksSFTTrainer(SFTTrainer):
@@ -21,6 +23,7 @@ class FireworksSFTTrainer(SFTTrainer):
         self._fireworks_runtime: FireworksRuntime | None = None
         self._ray_gpu_monitor = None
         self._num_training_gpus = 1
+        self.renderer = None
 
     def setup(self) -> None:
         tokenizer_kwargs = {
@@ -28,8 +31,31 @@ class FireworksSFTTrainer(SFTTrainer):
             "use_fast": not self.cfg.trainer.disable_fast_tokenizer,
             "padding_side": "left",
         }
-        self.is_vlm = False
         self.tokenizer = get_tokenizer(self.cfg.trainer.policy.model.path, **tokenizer_kwargs)
+        self.is_vlm = check_is_vlm(self.cfg.trainer.policy.model.path)
+        if self.is_vlm:
+            if self.sft_cfg.use_sequence_packing:
+                raise ValueError("Fireworks VLM SFT requires use_sequence_packing=False")
+            if self.sft_cfg.remove_microbatch_padding:
+                raise ValueError("Fireworks VLM SFT requires remove_microbatch_padding=False")
+            if self.sft_cfg.train_on_what != TrainOnWhat.LAST_ASSISTANT_MESSAGE:
+                raise ValueError("Fireworks VLM SFT requires train_on_what=last_assistant_message")
+            from renderers import create_renderer, is_multimodal
+
+            self.processor = get_processor(self.cfg.trainer.policy.model.path, **tokenizer_kwargs)
+            auto_renderer = create_renderer(self.tokenizer)
+            if not is_multimodal(auto_renderer):
+                raise ValueError(
+                    f"Model {self.cfg.trainer.policy.model.path!r} is a VLM but its renderer is not multimodal"
+                )
+            renderer_type: Any = type(auto_renderer)
+            self.renderer = renderer_type(
+                self.tokenizer,
+                auto_renderer.config,
+                processor=self.processor,
+            )
+            if not is_multimodal(self.renderer):
+                raise ValueError("Fireworks VLM renderer must support multimodal inputs")
         self.collator = self._build_collator(self.tokenizer)
         self._init_tracker()
         self._init_workers()
@@ -38,8 +64,6 @@ class FireworksSFTTrainer(SFTTrainer):
         self.tracker = None
 
     def _init_workers(self) -> None:
-        if self.is_vlm:
-            raise ValueError("Fireworks SFT currently supports text-only models")
         runtime = FireworksRuntime.connect(
             config=self.sft_cfg.fireworks,
             tokenizer=self.tokenizer,

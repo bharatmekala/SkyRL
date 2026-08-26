@@ -566,8 +566,8 @@ def validate_fireworks_sft_cfg(cfg: SFTConfig) -> None:
             raise ValueError("Invalid Fireworks deployment_id: " + "; ".join(errors))
     if cfg.fireworks.max_seq_len is None or cfg.fireworks.max_seq_len <= 0:
         raise ValueError("fireworks.max_seq_len must be positive")
-    if cfg.fireworks.trainer_replica_count != 1:
-        raise ValueError("Fireworks SFT currently supports one trainer replica")
+    if cfg.fireworks.trainer_replica_count < 1:
+        raise ValueError("fireworks.trainer_replica_count must be at least 1")
     if cfg.model.lora.rank < 0:
         raise ValueError("model.lora.rank must be non-negative")
     if len(cfg.optimizer_config.adam_betas) != 2:

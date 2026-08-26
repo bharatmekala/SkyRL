@@ -96,7 +96,7 @@ The output model ID must contain 1-63 lowercase letters, digits, or hyphens. Sky
 
 ## Initial limitations
 
-The hosted backend currently supports text-only SFT with one trainer replica and assumes the selected shape contains one accelerator for per-GPU throughput reporting. It rejects:
+The hosted backend currently supports text-only SFT. Set `fireworks.trainer_replica_count` above 1 to replicate the validated shape for data-parallel HSDP training; total GPUs are the shape's per-replica GPUs times the replica count. `train/tokens_per_second_per_gpu` is per-run rather than per-GPU because `_num_training_gpus` is hardcoded to 1. It rejects:
 
 - VLM examples;
 - controller sequence packing;

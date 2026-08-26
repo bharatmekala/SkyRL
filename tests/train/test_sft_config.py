@@ -281,6 +281,21 @@ class TestFireworksConfig:
         with pytest.raises((ValueError, AssertionError), match=message):
             validate_fireworks_sft_cfg(cfg)
 
+    def test_multiple_trainer_replicas_are_accepted(self):
+        cfg = self._cfg()
+        cfg.fireworks.trainer_replica_count = 2
+
+        validate_fireworks_sft_cfg(cfg)
+
+        assert build_skyrl_config_for_sft(cfg).trainer.fireworks.trainer_replica_count == 2
+
+    def test_nonpositive_trainer_replica_count_is_rejected(self):
+        cfg = self._cfg()
+        cfg.fireworks.trainer_replica_count = 0
+
+        with pytest.raises(ValueError, match="trainer_replica_count must be at least 1"):
+            validate_fireworks_sft_cfg(cfg)
+
     def test_deployment_id_is_not_required(self):
         cfg = self._cfg()
         cfg.fireworks.deployment_id = None
